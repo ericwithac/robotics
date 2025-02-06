@@ -1,87 +1,91 @@
+import pyzed.sl as sl
 import cv2
 import numpy as np
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import time
 
-import pyzed.sl as sl
+# TensorRT Logger
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
-def main():
-    # Create a ZED camera object
-    zed = sl.Camera()
+# Load the TensorRT Engine
+def load_engine(engine_path):
+    with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+        return runtime.deserialize_cuda_engine(f.read())
 
-    # Create a InitParameters object and set configuration parameters
-    init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720  # Use HD720 video mode
-    init_params.camera_fps = 30  # Set fps at 30
+# Allocate memory for TensorRT execution
+def allocate_buffers(engine):
+    inputs, outputs, bindings = [], [], []
+    stream = cuda.Stream()
+    for binding in engine:
+        size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+        dtype = trt.nptype(engine.get_binding_dtype(binding))
+        host_mem = cuda.pagelocked_empty(size, dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
+        bindings.append(int(device_mem))
+        if engine.binding_is_input(binding):
+            inputs.append({'host': host_mem, 'device': device_mem})
+        else:
+            outputs.append({'host': host_mem, 'device': device_mem})
+    return inputs, outputs, bindings, stream
 
-    # Open the camera
-    err = zed.open(init_params)
-    if err != sl.ERROR_CODE.SUCCESS:
-        print(f"Error {err}, exiting program.")
-        exit(1)
+# Run object detection on an image
+def detect_objects(context, inputs, outputs, bindings, stream, image):
+    img_resized = cv2.resize(image, (640, 640))
+    img_normalized = img_resized / 255.0
+    img_transposed = np.transpose(img_normalized, (2, 0, 1)).astype(np.float32)
+    np.copyto(inputs[0]['host'], img_transposed.ravel())
 
-    # Create and set RuntimeParameters object
-    runtime_parameters = sl.RuntimeParameters()
-    runtime_parameters.sensing_mode = sl.SENSING_MODE.FILL  # Use FILL sensing mode
+    start_time = time.time()
+    cuda.memcpy_htod_async(inputs[0]['device'], inputs[0]['host'], stream)
+    context.execute_async_v2(bindings, stream.handle, None)
+    cuda.memcpy_dtoh_async(outputs[0]['host'], outputs[0]['device'], stream)
+    stream.synchronize()
+    end_time = time.time()
 
-    # Create Mat objects to store images
-    image = sl.Mat()
-    depth = sl.Mat()
+    detections = outputs[0]['host'].reshape(-1, 85)  # Format: [x, y, w, h, conf, class1, class2, ...]
+    print(f"Inference Time: {end_time - start_time:.3f} sec")
+    return detections
 
-    # Load YOLOv11 model
-    net = cv2.dnn.readNet("yolov11.weights", "yolov11.cfg")
-    layer_names = net.getLayerNames()
-    output_layers = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+# Initialize ZED Camera
+zed = sl.Camera()
+init_params = sl.InitParameters(camera_resolution=sl.RESOLUTION.HD720, depth_mode=sl.DEPTH_MODE.NONE)
+status = zed.open(init_params)
 
-    while True:
-        # Grab an image
-        if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
-            # Retrieve left image
-            zed.retrieve_image(image, sl.VIEW.LEFT)
-            frame = image.get_data()
+if status != sl.ERROR_CODE.SUCCESS:
+    print("Failed to open ZED Camera")
+    exit(1)
 
-            # YOLO object detection
-            height, width, channels = frame.shape
-            blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
-            net.setInput(blob)
-            outs = net.forward(output_layers)
+image = sl.Mat()
 
-            # Showing information on the screen
-            class_ids = []
-            confidences = []
-            boxes = []
-            for out in outs:
-                for detection in out:
-                    scores = detection[5:]
-                    class_id = np.argmax(scores)
-                    confidence = scores[class_id]
-                    if confidence > 0.5:
-                        center_x = int(detection[0] * width)
-                        center_y = int(detection[1] * height)
-                        w = int(detection[2] * width)
-                        h = int(detection[3] * height)
-                        x = int(center_x - w / 2)
-                        y = int(center_y - h / 2)
-                        boxes.append([x, y, w, h])
-                        confidences.append(float(confidence))
-                        class_ids.append(class_id)
+# Load YOLOv11 TensorRT Model
+engine_path = "yolo11m.engine"
+engine = load_engine(engine_path)
+inputs, outputs, bindings, stream = allocate_buffers(engine)
+context = engine.create_execution_context()
 
-            indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-            for i in range(len(boxes)):
-                if i in indexes:
-                    x, y, w, h = boxes[i]
-                    label = str(class_ids[i])
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(frame, label, (x, y + 30), cv2.FONT_HERSHEY_PLAIN, 3, (0, 255, 0), 3)
+# Capture frames and run YOLO
+while True:
+    if zed.grab() == sl.ERROR_CODE.SUCCESS:
+        zed.retrieve_image(image, sl.VIEW.LEFT)
+        frame = image.get_data()[:, :, :3]  # Remove alpha channel
 
-            # Display the resulting frame
-            cv2.imshow('Frame', frame)
+        detections = detect_objects(context, inputs, outputs, bindings, stream, frame)
 
-            # Break the loop
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        # Draw bounding boxes
+        for det in detections:
+            x, y, w, h, conf, class_id = det[:6]
+            if conf > 0.5:
+                x1, y1 = int(x - w / 2), int(y - h / 2)
+                x2, y2 = int(x + w / 2), int(y + h / 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"Class {int(class_id)}: {conf:.2f}", (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    # Release the camera
-    zed.close()
-    cv2.destroyAllWindows()
+        cv2.imshow("YOLOv11 ZED Camera", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
 
-if __name__ == "__main__":
-    main()
+zed.close()
+cv2.destroyAllWindows()
